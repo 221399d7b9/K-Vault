@@ -24,7 +24,7 @@ export async function onRequestPost(context) {
   try {
     const body = await request.json();
     const url = String(body?.url || "").trim();
-    const storageMode = String(body?.storageMode || "telegram").toLowerCase();
+    let storageMode = String(body?.storageMode || "telegram").toLowerCase();
     const folderPath = normalizeFolderPath(body?.folderPath || body?.folder || "");
 
     if (!url) {
@@ -57,6 +57,9 @@ export async function onRequestPost(context) {
         413
       );
     }
+
+    // 超过 Telegram 20MB URL 转存限制时，自动切换到已配置的大文件后端（R2 > S3 > WebDAV > GitHub）
+    storageMode = resolveLargeFileStorageMode(storageMode, fileSize, env);
 
     const storageValidation = validateStorageSize(storageMode, fileSize);
     if (!storageValidation.ok) {
@@ -194,6 +197,30 @@ function validateStorageSize(storageMode, fileSize) {
     return { ok: false, status: limit.status, message: limit.message };
   }
   return { ok: true };
+}
+
+const TELEGRAM_WEB_UPLOAD_LIMIT = 20 * MB;
+
+// 仅在默认走 Telegram 且文件超过 20MB URL 转存限制时生效：
+// 按优先级检测已配置的大文件后端并切换；若一个都没配置则保持 Telegram（维持原有 413 报错）。
+function resolveLargeFileStorageMode(storageMode, fileSize, env) {
+  if (storageMode !== "telegram") return storageMode;
+  if (Number(fileSize || 0) <= TELEGRAM_WEB_UPLOAD_LIMIT) return storageMode;
+  const fallbacks = [
+    { mode: "r2", configured: () => Boolean(env.R2_BUCKET) },
+    { mode: "s3", configured: () => Boolean(env.S3_ENDPOINT && env.S3_ACCESS_KEY_ID) },
+    { mode: "webdav", configured: () => hasWebDAVConfig(env) },
+    { mode: "github", configured: () => hasGitHubConfig(env) },
+  ];
+  for (const { mode, configured } of fallbacks) {
+    if (configured()) {
+      console.info(
+        `Large file (${fileSize} bytes) exceeds Telegram 20MB URL upload limit, falling back to ${mode}.`
+      );
+      return mode;
+    }
+  }
+  return storageMode;
 }
 
 function normalizeFolderPath(value) {

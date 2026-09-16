@@ -67,7 +67,9 @@ export async function onRequestPost(context) {
     }
 
     const contentType = fetched.contentType || "application/octet-stream";
-    const fileName = buildFileName(parsedUrl, contentType);
+    // CDN 常返回 application/octet-stream，先按文件头魔数嗅探真实类型（如 mp4），避免扩展名误判为 bin
+    const detectedType = sniffMimeTypeFromBytes(arrayBuffer, contentType);
+    const fileName = buildFileName(parsedUrl, detectedType);
     const fileExtension = getFileExtension(fileName);
 
     if (storageMode === "r2") {
@@ -294,14 +296,74 @@ function getExtensionFromMimeType(mimeType) {
 function buildFileName(parsedUrl, contentType) {
   let fileName = decodeURIComponent((parsedUrl.pathname.split("/").pop() || "").split("?")[0]);
   if (!fileName) {
-    fileName = `url_${Date.now()}.${getExtensionFromMimeType(contentType)}`;
+    fileName = `url_${Date.now()}.${resolveExtension(parsedUrl, contentType)}`;
   }
 
   if (!fileName.includes(".")) {
-    fileName = `${fileName}.${getExtensionFromMimeType(contentType)}`;
+    fileName = `${fileName}.${resolveExtension(parsedUrl, contentType)}`;
   }
 
   return fileName;
+}
+
+// 扩展名解析顺序：Content-Type 映射 → URL 查询参数中的类型提示（如 mime_type=video_mp4）→ bin
+function resolveExtension(parsedUrl, contentType) {
+  const ext = getExtensionFromMimeType(contentType);
+  if (ext !== "bin") return ext;
+
+  const hintType = getMimeTypeFromUrlQuery(parsedUrl);
+  if (hintType) {
+    const hintExt = getExtensionFromMimeType(hintType);
+    if (hintExt !== "bin") return hintExt;
+  }
+  return "bin";
+}
+
+// 从查询参数中提取类型提示，兼容 video_mp4 / video%2Fmp4 / video/mp4 等写法
+function getMimeTypeFromUrlQuery(parsedUrl) {
+  for (const value of parsedUrl.searchParams.values()) {
+    const decoded = decodeURIComponent(value).trim().toLowerCase();
+    const normalized = decoded.includes("_") && !decoded.includes("/")
+      ? decoded.replace(/_/g, "/")
+      : decoded;
+    if (/^(image|video|audio)\/[a-z0-9]+$/.test(normalized)) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+// 按文件头魔数嗅探 MIME 类型；无法识别时返回原始 Content-Type
+function sniffMimeTypeFromBytes(buffer, fallback) {
+  if (!buffer || buffer.byteLength < 12) return fallback;
+  const view = new DataView(buffer);
+
+  const ascii = (offset, length) => {
+    let out = "";
+    for (let i = 0; i < length; i++) out += String.fromCharCode(view.getUint8(offset + i));
+    return out;
+  };
+  const u32 = (offset) => view.getUint32(offset);
+
+  // MP4/MOV: 偏移 4 处为 "ftyp"
+  if (ascii(4, 4) === "ftyp") {
+    const brand = ascii(8, 4);
+    if (brand === "qt  ") return "video/quicktime";
+    return "video/mp4";
+  }
+  if (u32(0) === 0x1a45dfa3) return "video/webm";                 // WebM/MKV
+  if (view.getUint16(0) === 0xffd8) return "image/jpeg";          // JPEG
+  if (u32(0) === 0x89504e47) return "image/png";                  // PNG
+  if (ascii(0, 3) === "GIF") return "image/gif";                  // GIF
+  if (ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") return "image/webp";
+  if (ascii(0, 4) === "RIFF" && ascii(8, 4) === "WAVE") return "audio/wav";
+  if (ascii(0, 4) === "%PDF") return "application/pdf";
+  if (ascii(0, 3) === "ID3" || view.getUint16(0) === 0xfffb || view.getUint16(0) === 0xfff3) return "audio/mpeg";
+  if (ascii(0, 4) === "OggS") return "audio/ogg";
+  if (ascii(0, 4) === "fLaC") return "audio/flac";
+  if (u32(0) === 0x504b0304) return "application/zip";            // ZIP
+
+  return fallback;
 }
 
 function randomId(prefix) {
